@@ -1,0 +1,18 @@
+sudo apt install python3
+sudo apt install nodejs
+sudo apt instal npm
+sudo npm install --global yarn
+
+# install react-scripts package
+yarn add react-scripts
+
+# install Node Version Manager
+curl -o- https://raw.githubusercontent.com/nvm-sh/nvm/v0.39.7/install.sh | bash
+source ~/.bashrc
+
+# install node version 16
+nvm install 16
+nvm use 16
+
+# start app
+yarn start

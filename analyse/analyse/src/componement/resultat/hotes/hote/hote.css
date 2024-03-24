@@ -1,0 +1,21 @@
+.hote{
+  position: relative;
+    margin: 3px;
+  width: 250px;
+  height: 200px;
+  border: 0px solid black;
+
+  line-height: 0.2;
+}
+
+
+.pouce{
+    position: absolute;
+    bottom: 0;
+    left: 0;
+    background-color: rgba(0, 0, 0, 0.137);
+    padding: 10px;
+    border-radius: 100px;
+    width: 50px;
+    height: 50px;
+}

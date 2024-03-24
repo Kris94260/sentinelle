@@ -1,0 +1,12 @@
+.App {
+  text-align: center;
+  width: 100%;
+}
+
+
+.column_area{
+  display: flex;
+  flex-direction: column;
+  justify-content: flex-start;
+
+}

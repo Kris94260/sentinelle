@@ -1,0 +1,18 @@
+
+.filtre{
+  
+  
+  display: flex;
+  flex-direction: row;
+  justify-content: space-around;
+}
+
+.optionFiltre {
+    display: flex;
+    align-items: center;
+  }
+  
+
+.select {
+    width: 10em;
+}

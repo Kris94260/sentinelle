@@ -1,0 +1,2 @@
+{"interface": {"Numero": 2, "interface": "wlp2s0", "ip_address": "192.168.50.49", "mask": "255.255.254.0", "network_address": "192.168.50.0/23", "speed": "None"}, "first address": "192.168.50.1", "last address": "192.168.51.254", "network_address": "192.168.50.0", "broadcast": "192.168.51.255"}
+

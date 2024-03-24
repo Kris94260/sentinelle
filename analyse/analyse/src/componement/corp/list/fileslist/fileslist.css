@@ -1,0 +1,25 @@
+
+
+.file {
+    font-weight: bold;
+    width: 80%;
+    font-size: 0.7em;
+    text-overflow:inherit;
+    overflow:hidden;
+    white-space:nowrap;
+    text-align: center;
+}
+
+.file_select{
+    color:firebrick;
+    width: 80%;
+    font-weight: bold;
+    font-size: 0.8em;
+    text-overflow:inherit;
+    overflow:hidden;
+    white-space:nowrap;
+}
+
+.file:hover{
+    cursor: pointer;
+}

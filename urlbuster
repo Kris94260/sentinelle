@@ -1,0 +1,961 @@
+#!/usr/bin/env python
+# -*- coding: utf-8 -*-
+"""URL bruteforcer to locate existing and/or hidden files or directories.."""
+
+from __future__ import print_function
+
+import itertools
+import os
+import re
+import sys
+import time
+import argparse
+import requests
+from datetime import datetime
+from requests.packages.urllib3.exceptions import InsecureRequestWarning
+
+requests.packages.urllib3.disable_warnings(InsecureRequestWarning)
+
+
+# -------------------------------------------------------------------------------------------------
+# GLOBALS
+# -------------------------------------------------------------------------------------------------
+
+VERSION = "0.5.1"
+
+DEFAULT_USERAGENT = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/79.0.3945.123 Safari/537.36"  # noqa: E501
+DEFAULT_SLASH = "no"
+SUPPORTED_SLASHES = {
+    "no": [""],
+    "yes": ["/"],
+    "both": ["", "/"],
+}
+DEFAULT_METHOD = "GET"
+SUPPORTED_METHODS = ["GET", "POST", "PUT", "DELETE", "PATCH", "HEAD", "OPTIONS"]
+DEFAULT_CODES = [
+    "2..",
+    "3..",
+    "403",
+    "407",
+    "411",
+    "426",
+    "429",
+    "500",
+    "505",
+    "511",
+]
+DEFAULT_TIMEOUT = 5.0
+DEFAULT_RETRIES = 3
+
+
+# -------------------------------------------------------------------------------------------------
+# HELPER FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+
+
+def get_status_text(curr, total, method, target, curr_try, retries):
+    return "{clr}({curr}/{total}): ({curr_try}/{retries}) [{method}] {target}{rst}".format(
+        clr="\033[93m",
+        curr=curr,
+        total=total,
+        curr_try=curr_try,
+        retries=retries,
+        method=method,
+        target=target,
+        rst="\033[00m",
+    )
+
+
+def print_wait_message(delay):
+    """Print temporary delay message."""
+    print("Delaying next request for %ss ..." % (str(delay)), end="\r")
+    sys.stdout.flush()
+
+
+def print_progress(status):
+    """Print temporary status."""
+    print(status, end="\r")
+    sys.stdout.flush()
+
+
+def clear_progress(status):
+    """Deletet temporary status."""
+    print(" " * len(status), end="\r")  # clear line
+    sys.stdout.flush()
+
+
+def print_succ(data):
+    """Print success."""
+    print("{color}{data}{rst}".format(color="\033[92m", data=data, rst="\033[00m"))
+
+
+def print_miss(data):
+    """Print success."""
+    print("{data}".format(data=data))
+
+
+def print_err(data):
+    """Print success."""
+    print("{color}{data}{rst}".format(color="\033[91m", data=data, rst="\033[00m"))
+
+
+# -------------------------------------------------------------------------------------------------
+# FILE FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+
+
+def read_file(filepath):
+    """Read words from file line by line and store each line as a list entry."""
+    with open(filepath) as f:
+        content = f.readlines()
+    # Remove whitespace characters like '\n' at the end of each line
+    return [x.strip() for x in content]
+
+
+def append_output(fp, data):
+    """Append data to an output file."""
+    fp.write("%s\n" % (data))
+
+
+# -------------------------------------------------------------------------------------------------
+# URL FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+
+
+def get_session(auth, headers, proxies):
+    """Return session object for persistent connection."""
+    s = requests.Session()
+    if auth is not None:
+        s.auth = auth
+    if proxies is not None:
+        s.proxies = proxies
+    s.headers.update(headers)
+
+    return s
+
+
+def session_request(s, url, method, payloads, cookies, headers, timeout, follow, verify):
+    """Connect to a persistent http connection."""
+    data = {}
+    if method in ["POST", "PUT", "PATCH"]:
+        data = payloads
+    # s.(get|post|delete|...)
+    fn = getattr(s, method.lower())
+    try:
+        return (
+            True,
+            fn(
+                url,
+                data=data,
+                allow_redirects=follow,
+                cookies=cookies,
+                headers=headers,
+                timeout=timeout,
+                verify=verify,
+            ),
+        )
+    except requests.exceptions.Timeout as err:
+        # Maybe set up for a retry, or continue in a retry loop
+        return False, {"type": "timeout", "err": err}
+    except requests.exceptions.TooManyRedirects as err:
+        # Tell the user their URL was bad and try a different one
+        return False, {"type": "toomanyredirects", "err": err}
+    except requests.exceptions.RequestException as err:
+        # catastrophic error. bail.
+        return False, {"type": "exception", "err": err}
+
+
+def request(url, method, auth, payloads, cookies, headers, proxies, timeout, follow, verify):
+    """Open an http request."""
+    data = {}
+    if method in ["POST", "PUT", "PATCH"]:
+        data = payloads
+    # requests.(get|post|delete|...)
+    fn = getattr(requests, method.lower())
+    try:
+        return (
+            True,
+            fn(
+                url,
+                data=data,
+                allow_redirects=follow,
+                auth=auth,
+                cookies=cookies,
+                headers=headers,
+                proxies=proxies,
+                timeout=timeout,
+                verify=verify,
+            ),
+        )
+    except requests.exceptions.Timeout as err:
+        # Maybe set up for a retry, or continue in a retry loop
+        return False, {"type": "timeout", "err": err}
+    except requests.exceptions.TooManyRedirects as err:
+        # Tell the user their URL was bad and try a different one
+        return False, {"type": "toomanyredirects", "err": err}
+    except requests.exceptions.RequestException as err:
+        # catastrophic error. bail.
+        return False, {"type": "exception", "err": err}
+
+
+def check_code(code, codes):
+    """Check if http status code is a successful code."""
+    for reg in codes:
+        if re.match(reg, str(code)):
+            return True
+
+    return False
+
+
+# -------------------------------------------------------------------------------------------------
+# ARGS
+# -------------------------------------------------------------------------------------------------
+
+
+def _args_check_codes(value):
+    """Check argument for valid status codes."""
+    strval = str(value)
+    code = strval.replace(".", "1")
+    try:
+        code = int(code)
+    except ValueError:
+        raise argparse.ArgumentTypeError('Invalid status code "%s"', strval)
+    if code < 100 or code >= 600:
+        raise argparse.ArgumentTypeError('Invalid status code "%s"', strval)
+    return strval
+
+
+def _args_check_auth(value):
+    """Check argument for valid methods."""
+    strval = str(value)
+    auth = strval.split(":")
+    if len(auth) != 2:
+        raise argparse.ArgumentTypeError('Invalid auth value "%s"', strval)
+    return strval
+
+
+def _args_check_delay(value):
+    """Check argument for valid delay."""
+    try:
+        floatval = float(value)
+    except ValueError:
+        raise argparse.ArgumentTypeError('Invalid delay value "%s"', str(value))
+    if floatval <= 0:
+        raise argparse.ArgumentTypeError('Invalid delay value "%s"', str(value))
+
+    return floatval
+
+
+def _args_check_method(value):
+    """Check argument for valid methods."""
+    strval = str(value)
+    method = strval
+    if method not in SUPPORTED_METHODS:
+        raise argparse.ArgumentTypeError(
+            'Invalid method "%s". Supported: %s' % (strval, ", ".join(SUPPORTED_METHODS))
+        )
+    return strval
+
+
+def _args_check_slash(value):
+    """Check argument for valid slash value."""
+    strval = str(value)
+    if strval not in SUPPORTED_SLASHES.keys():
+        raise argparse.ArgumentTypeError(
+            'Invalid slash value "%s". Supported: %s' % (value, ", ".join(SUPPORTED_SLASHES.keys()))
+        )
+    return strval
+
+
+def _args_check_header(value):
+    """Check argument for valid header value."""
+    strval = str(value)
+    if ":" not in strval:
+        raise argparse.ArgumentTypeError('Invalid header value "%s".' % (strval))
+    return strval
+
+
+def _args_check_proxy(value):
+    """Check argument for valid proxy value."""
+    strval = str(value)
+    if not re.match("(http(s)?|socks5)://(.+:.+@)?.+:[0-9]+", strval):
+        raise argparse.ArgumentTypeError('Invalid proxy value "%s".' % (strval))
+    print(strval)
+    return strval
+
+
+def _args_check_payload(value):
+    """Check argument for valid payload value."""
+    strval = str(value)
+    if "=" not in strval:
+        raise argparse.ArgumentTypeError('Invalid payload value "%s".' % (strval))
+    return strval
+
+
+def _args_check_cookie(value):
+    """Check argument for valid cookie value."""
+    strval = str(value)
+    if "=" not in strval:
+        raise argparse.ArgumentTypeError('Invalid cookie value "%s".' % (strval))
+    return strval
+
+
+def _args_check_file(value):
+    """Check argument for existing file."""
+    strval = str(value)
+    if not os.path.isfile(strval):
+        raise argparse.ArgumentTypeError('File "%s" not found.' % value)
+    return strval
+
+
+def get_args():
+    """Retrieve command line arguments."""
+    parser = argparse.ArgumentParser(
+        formatter_class=argparse.RawTextHelpFormatter,
+        add_help=False,
+        usage="""%(prog)s [options] -w <str>/-W <file> BASE_URL
+       %(prog)s -V, --version
+       %(prog)s -h, --help
+""",
+        description="""URL bruteforcer to locate existing and/or hidden files or directories.
+
+Similar to dirb or gobuster, but also allows to iterate over multiple HTTP request methods,
+multiple useragents and multiple host header values.
+""",
+        epilog="""examples
+
+  %(prog)s -W /path/to/words http://example.com/
+  %(prog)s -W /path/to/words http://example.com:8000/
+  %(prog)s -k -W /path/to/words https://example.com:10000/""",
+    )
+    required = parser.add_argument_group("required arguments")
+    optional = parser.add_argument_group("optional global arguments")
+    mutating = parser.add_argument_group(
+        title="optional mutating arguments",
+        description="The following arguments will increase the total number of requests to be"
+        + " made by\napplying various mutations and testing each mutation on a separate request.",
+    )
+    misc = parser.add_argument_group("misc arguments")
+    word = required.add_mutually_exclusive_group(required=True)
+    word.add_argument(
+        "-w", "--word", metavar="str", type=str, help="Word to use.",
+    )
+    word.add_argument(
+        "-W", "--wordlist", metavar="f", type=_args_check_file, help="Path to wordlist to use.",
+    )
+    optional.add_argument(
+        "-n",
+        "--new",
+        required=False,
+        default=False,
+        action="store_true",
+        help="Use a new connection for every request.\n"
+        + "If not specified persistent http connection will be used for all requests.\n"
+        + "Note, using a new connection will decrease performance,\n"
+        + "but ensure to have a clean state on every request.\n"
+        + "A persistent connection on the other hand will use any additional cookie values\n"
+        + "it has received from a previous request.",
+    )
+    optional.add_argument(
+        "-f",
+        "--follow",
+        required=False,
+        default=False,
+        action="store_true",
+        help="Follow redirects.",
+    )
+    optional.add_argument(
+        "-k",
+        "--insecure",
+        required=False,
+        default=False,
+        action="store_true",
+        help="Do not verify TLS certificates.",
+    )
+    optional.add_argument(
+        "-v",
+        "--verbose",
+        required=False,
+        default=False,
+        action="store_true",
+        help="Show also missed URLs.",
+    )
+    optional.add_argument(
+        "--code",
+        nargs="+",
+        metavar="str",
+        required=False,
+        default=DEFAULT_CODES,
+        type=_args_check_codes,
+        help="HTTP status code to treat as success.\n"
+        + "You can use a '.' (dot) as a wildcard.\n"
+        + "Default: "
+        + " ".join(DEFAULT_CODES),
+    )
+    optional.add_argument(
+        "--payload",
+        nargs="+",
+        metavar="p",
+        default=[],
+        type=_args_check_payload,
+        help="POST, PUT and PATCH payloads for all requests.\n"
+        + "Note, multiple values are allowed for multiple payloads.\n"
+        + "Note, if duplicates are specified, the last one will overwrite.\n"
+        + "See --mpayload for mutations.\n"
+        + "Format: <key>=<val> [<key>=<val>]",
+    )
+    optional.add_argument(
+        "--header",
+        nargs="+",
+        metavar="h",
+        default=[],
+        type=_args_check_header,
+        help="Custom http header string to add to all requests.\n"
+        + "Note, multiple values are allowed for multiple headers.\n"
+        + "Note, if duplicates are specified, the last one will overwrite.\n"
+        + "See --mheaders for mutations.\n"
+        + "Format: <key>:<val> [<key>:<val>]",
+    )
+    optional.add_argument(
+        "--cookie",
+        nargs="+",
+        metavar="c",
+        default=[],
+        type=_args_check_cookie,
+        help="Cookie string to add to all requests.\n" + "Format: <key>=<val> [<key>=<val>]",
+    )
+    optional.add_argument(
+        "--proxy",
+        metavar="str",
+        required=False,
+        default=None,
+        type=_args_check_proxy,
+        help="Use a proxy for all requests.\n"
+        + "Format: http://<host>:<port>\nFormat: http://<user>:<pass>@<host>:<port>\n"
+        + "Format: https://<host>:<port>\nFormat: https://<user>:<pass>@<host>:<port>\n"
+        + "Format: socks5://<host>:<port>\nFormat: socks5://<user>:<pass>@<host>:<port>",
+    )
+    auth = optional.add_mutually_exclusive_group(required=False)
+    auth.add_argument(
+        "--auth-basic",
+        metavar="str",
+        required=False,
+        default=None,
+        type=_args_check_auth,
+        help="Use basic authentication for all requests.\n" + "Format: <user>:<pass>",
+    )
+    auth.add_argument(
+        "--auth-digest",
+        metavar="str",
+        default=None,
+        type=_args_check_auth,
+        help="Use digest authentication for all requests.\n" + "Format: <user>:<pass>",
+    )
+    optional.add_argument(
+        "--timeout",
+        metavar="sec",
+        required=False,
+        default=DEFAULT_TIMEOUT,
+        type=float,
+        help="Connection timeout in seconds for each request.\nDefault: " + str(DEFAULT_TIMEOUT),
+    )
+    optional.add_argument(
+        "--retry",
+        metavar="num",
+        required=False,
+        default=DEFAULT_RETRIES,
+        type=int,
+        help="Connection retries per request.\nDefault: " + str(DEFAULT_RETRIES),
+    )
+    optional.add_argument(
+        "--delay",
+        metavar="sec",
+        required=False,
+        default=0,
+        type=_args_check_delay,
+        help="Delay between requests to not flood the server.",
+    )
+    optional.add_argument(
+        "--output",
+        metavar="file",
+        required=False,
+        default=None,
+        type=str,
+        help="Output file to write results to.",
+    )
+    mutating.add_argument(
+        "--method",
+        nargs="+",
+        metavar="m",
+        required=False,
+        default=[DEFAULT_METHOD],
+        type=_args_check_method,
+        help="List of HTTP methods to test each request against.\n"
+        + "Note, each supplied method will double the number of requests.\n"
+        + "Supported methods: "
+        + " ".join(SUPPORTED_METHODS)
+        + "\n"
+        + "Default: "
+        + DEFAULT_METHOD,
+    )
+    mutating.add_argument(
+        "--mpayload",
+        nargs="+",
+        metavar="p",
+        default=[],
+        type=_args_check_payload,
+        help="POST, PUT and PATCH payloads to mutate all requests..\n"
+        + "Note, multiple values are allowed for multiple payloads.\n"
+        + "Format: <key>=<val> [<key>=<val>]",
+    )
+    mutating.add_argument(
+        "--mheader",
+        nargs="+",
+        metavar="h",
+        default=[],
+        type=_args_check_header,
+        help="Custom http header string to add to mutate all requests.\n"
+        + "Note, multiple values are allowed for multiple headers.\n"
+        + "Format: <key>:<val> [<key>:<val>]",
+    )
+    mutating.add_argument(
+        "--ext",
+        nargs="+",
+        metavar="ext",
+        default=[""],
+        required=False,
+        help="List of file extensions to to add to words for testing.\n"
+        + "Note, each supplied extension will double the number of requests.\n"
+        + "Format: .zip [.pem]\n",
+    )
+    mutating.add_argument(
+        "--slash",
+        metavar="str",
+        required=False,
+        default="no",
+        type=_args_check_slash,
+        help="Append or omit a trailing slash to URLs to test.\n"
+        + "Note, a slash will be added after the extensions if they are specified as well.\n"
+        + "Note, using 'both' will double the number of requests.\n"
+        + "Options: "
+        + ", ".join(SUPPORTED_SLASHES.keys())
+        + "\n"
+        + "Default: "
+        + DEFAULT_SLASH,
+    )
+    misc.add_argument("-h", "--help", action="help", help="Show this help message and exit")
+    misc.add_argument(
+        "-V",
+        "--version",
+        action="version",
+        version="%(prog)s " + VERSION + " by cytopia",
+        help="Show version information",
+    )
+    parser.add_argument("BASE_URL", type=str, help="The base URL to scan.")
+    return parser.parse_args()
+
+
+# -------------------------------------------------------------------------------------------------
+# PAREMETER GET FUNCTIONS
+# -------------------------------------------------------------------------------------------------
+
+
+def get_words(word, wordlist):
+    """Get list of words."""
+    if word is not None:
+        return [word]
+    return read_file(wordlist)
+
+
+def get_headers(headers):
+    """Get dict of HTTP headers.
+    This converts cmd argument headers from [key1:val, key2:val] to {key1:val, key2:val}
+    and merges it with requests library default header."""
+    data = requests.utils.default_headers()
+    for header in headers:
+        key, val = header.split(":")
+        key = key.strip()
+        val = val.strip()
+        if key in data:
+            del data[key]
+        data[key] = val
+    return data
+
+
+def get_payloads(payloads):
+    """Get dict of POST/PUT/PATCH payloads.
+    This converts cmd argument payloads from [key1=val, key2=val] to {key1:val, key2:val}."""
+    data = {}
+    for payload in payloads:
+        key, val = payload.split("=")
+        key = key.strip()
+        val = val.strip()
+        data[key] = val
+    return data
+
+
+def get_cookies(cookies):
+    """Get dict of HTTP cookies.
+    This converts cmd argument cookies from [key1=val, key2=val] to {key1:val, key2:val}."""
+    data = {}
+    for cookie in cookies:
+        key, val = cookie.split("=")
+        key = key.strip()
+        val = val.strip()
+        data[key] = val
+    return data
+
+
+def get_proxies(proxy):
+    """Get dict of proxies."""
+    if proxy is not None:
+        return {
+            "http": proxy,
+            "https": proxy,
+        }
+    return None
+
+
+def get_auth_method(auth_basic, auth_digest):
+    """Get authentication object."""
+    if auth_basic is not None:
+        return requests.auth.HTTPBasicAuth(auth_basic[0], auth_basic[1])
+    if auth_digest is not None:
+        return requests.auth.HTTPDigestAuth(auth_digest[0], auth_digest[1])
+    return None
+
+
+def get_slash_values(slash):
+    """Get list with empty element and or slash element."""
+    if slash is not None:
+        return SUPPORTED_SLASHES[slash]
+    return SUPPORTED_SLASHES[DEFAULT_SLASH]
+
+
+def merge_dict_values(values, mvalues, sep=":"):
+    """Merge values with mutatable values (headers and payloads)."""
+    data = {}
+    # {key: val}
+    for k in values:
+        data[k] = [values[k]]
+    # {key: [val1, val2]}
+    for m in mvalues:
+        key, val = m.split(sep)
+        key = key.strip()
+        val = val.strip()
+        if key in data:
+            data[key].append(val)
+        else:
+            data[key] = [val]
+
+    return data
+
+
+def cartesian_product(**kwargs):
+    """Get mutated list of dict with all combinations via cartesian product."""
+    # Input:  {key: [val1, val2]}
+    # Output: [{key: val1}, {key: val2}]
+    keys = kwargs.keys()
+    vals = kwargs.values()
+    data = []
+    for instance in itertools.product(*vals):
+        data.append(dict(zip(keys, instance)))
+    return data
+
+
+def mutate_headers(headers, mheaders):
+    """Get list of header dict mutations."""
+    headers = merge_dict_values(headers, mheaders, ":")
+    return cartesian_product(**headers)
+
+
+def mutate_payloads(payloads, mpayloads):
+    """Get list of payload dict mutations."""
+    payloads = merge_dict_values(payloads, mpayloads, "=")
+    return cartesian_product(**payloads)
+
+
+def intersection(list1, list2):
+    """Get intersection values of two lists."""
+    return list(set(list1).intersection(list2))
+
+
+# -------------------------------------------------------------------------------------------------
+# MAIN ENTRYPOINT: BANNER
+# -------------------------------------------------------------------------------------------------
+
+
+def total_requests(words, mheaders, mpayloads, args):
+    len_mpayloads = 1 if mpayloads == [{}] else len(mpayloads) - 1
+    total_with_playload_mutations = (
+        len(words)
+        * len_mpayloads
+        * len(mheaders)
+        * len(intersection(args.method, ["POST", "PUT", "PATCH"]))
+        * (2 if args.slash == "both" else 1)
+        * (1 if len(args.ext) == 0 else len(args.ext))
+    )
+    total_no_playloads = (
+        len(words)
+        * len(mheaders)
+        * len(intersection(args.method, ["GET", "HEAD", "OPTIONS", "DELETE"]))
+        * (2 if args.slash == "both" else 1)
+        * (1 if len(args.ext) == 0 else len(args.ext))
+    )
+    return total_with_playload_mutations + total_no_playloads
+
+
+def get_banner(url, words, args, mheaders, mpayloads):
+    """Print initial banner."""
+    now = datetime.now()
+    time = now.strftime("%Y-%m-%d %H:%M:%S")
+
+    total = total_requests(words, mheaders, mpayloads, args)
+    mmethods = ", ".join(intersection(args.method, ["POST", "PUT", "PATCH"]))
+
+    auth = ""
+    if args.auth_basic is not None:
+        auth = "\n            Basic auth:        {auth}".format(auth=args.auth_basic)
+    elif args.auth_digest is not None:
+        auth = "\n            Digest auth:       {auth}".format(auth=args.auth_digest)
+
+    if args.ext[0] == "" and len(args.ext) == 1:
+        ext_value = "empty extension"
+    else:
+        ext_value = ", ".join('"' + item + '"' for item in args.ext)
+
+    # http://www.patorjk.com/software/taag/
+    return """
+   ██╗   ██╗██████╗ ██╗     ██████╗ ██╗   ██╗███████╗████████╗███████╗██████╗
+   ██║   ██║██╔══██╗██║     ██╔══██╗██║   ██║██╔════╝╚══██╔══╝██╔════╝██╔══██╗
+   ██║   ██║██████╔╝██║     ██████╔╝██║   ██║███████╗   ██║   █████╗  ██████╔╝
+   ██║   ██║██╔══██╗██║     ██╔══██╗██║   ██║╚════██║   ██║   ██╔══╝  ██╔══██╗
+   ╚██████╔╝██║  ██║███████╗██████╔╝╚██████╔╝███████║   ██║   ███████╗██║  ██║
+    ╚═════╝ ╚═╝  ╚═╝╚══════╝╚═════╝  ╚═════╝ ╚══════╝   ╚═╝   ╚══════╝╚═╝  ╚═╝
+
+                               {version} by Krxs94
+
+      SETTINGS
+            Base URL:          {url}
+            Valid codes:       {codes}
+            HTTP Connection:   {conn}
+            Redirects:         {redir}
+            Payloads:          {payloads}{cookie}{proxy}{auth}
+            Timeout:           {timeout}s
+            Retries:           {retries}
+            Delay:             {delay}
+
+      MUTATIONS
+            Mutating headers:  {num_header}
+            Mutating payloads: {num_payloads}{mmethods}
+            Methods:           {num_method} ({methods})
+            Slashes:           {slash}
+            Extensions:        {num_ext} ({exts})
+            Words:             {words}
+
+      TOTAL REQUESTS: {total}
+      START TIME:     {time}
+
+""".format(
+        version=VERSION,
+        url=url,
+        conn="Non-persistent" if args.new else "Persistent",
+        payloads="&".join(args.payload) if args.payload else "None",
+        redir="Follow" if args.follow else "Don't follow",
+        codes=", ".join(args.code),
+        timeout=args.timeout,
+        retries=args.retry,
+        delay=str(args.delay) + "s" if args.delay else "None",
+        cookie="\n" + " " * 12 + "Cookies:           " + "&".join(args.cookie)
+        if args.cookie
+        else "",
+        proxy="\n" + " " * 12 + "Proxy:             " + args.proxy if args.proxy else "",
+        auth=auth,
+        num_header=len(mheaders),
+        num_payloads=0 if mpayloads == [{}] else len(mpayloads),
+        num_method=len(args.method),
+        methods=", ".join(args.method),
+        slash=args.slash,
+        num_ext=len(args.ext),
+        exts=ext_value,
+        words=len(words),
+        total=total,
+        time=time,
+        mmethods=" (" + mmethods + ")" if len(mmethods) else "",
+    )
+
+
+def get_mutation_round_header_banner(headers):
+    """Print round header with http headers."""
+    data = []
+    max_length = 80
+    key_length = len(max(headers.keys(), key=len))
+    data.append("-" * max_length)
+    for key in headers:
+        padding = key_length - len(key)
+        value = headers[key]
+        while len(value) > max_length - len(key) - padding - 2:
+            value = value[:-1]
+        data.append("{key}: {pad}{val}".format(key=key, pad=" " * padding, val=value))
+    return "\n".join(data) + "\n"
+
+
+# -------------------------------------------------------------------------------------------------
+# MAIN ENTRYPOINT
+# -------------------------------------------------------------------------------------------------
+
+
+def main():
+    """Start the program."""
+    args = get_args()
+
+    # optional arguments
+    headers_initial = get_headers(args.header)
+    payloads_initial = get_payloads(args.payload)
+
+    cookies = get_cookies(args.cookie)
+    proxies = get_proxies(args.proxy)
+    auth = get_auth_method(args.auth_basic, args.auth_digest)
+
+    # mutating arguments
+    headers_mutated = mutate_headers(headers_initial, args.mheader)
+    payloads_mutated = mutate_payloads(payloads_initial, args.mpayload)
+
+    # If we're using POST/PUT/PATCH payloads, we also add an empty item
+    # so the the for loop can work for GET and other methods.
+    if payloads_mutated != [{}]:
+        payloads_mutated.append({})
+
+    methods = args.method
+    extensions = args.ext
+    slashes = get_slash_values(args.slash)
+
+    # dictionary words
+    words = get_words(args.word, args.wordlist)
+
+    banner = get_banner(args.BASE_URL, words, args, headers_mutated, payloads_mutated)
+
+    if args.output is not None:
+        try:
+            fp = open(args.output, "w", buffering=1)
+            append_output(fp, banner)
+        except (IOError, OSError) as err:
+            print("%s" % (err), file=sys.stderr)
+            sys.exit(1)
+
+    print(banner)
+
+    if not args.new:
+        sess = get_session(auth, headers_initial, proxies)
+
+    curr = 1
+    total = total_requests(words, headers_mutated, payloads_mutated, args)
+    for headers in headers_mutated:
+        hbanner = get_mutation_round_header_banner(headers)
+        print(hbanner)
+        if args.output is not None:
+            append_output(fp, hbanner)
+        if args.output is not None:
+            append_output(fp, hbanner)
+        for method in methods:
+            padding = len(max(methods, key=len)) - len(method)
+            for payloads in payloads_mutated:
+                if len(payloads) and method not in ["POST", "PUT", "PATCH"]:
+                    continue
+                if (
+                    not len(payloads)
+                    and method in ["POST", "PUT", "PATCH"]
+                    and payloads_mutated != [{}]
+                ):
+                    continue
+                if method in ["POST", "PUT", "PATCH"]:
+                    payload_msg = "Payload for {m}: {p}".format(
+                        m=method, p="&".join([k + "=" + payloads[k] for k in payloads])
+                    )
+                else:
+                    payload_msg = "Payload for {m}: None".format(m=method)
+                print(payload_msg)
+                if args.output is not None:
+                    append_output(fp, payload_msg)
+                for word in words:
+                    for extension in extensions:
+                        for slash in slashes:
+                            target = args.BASE_URL + word + extension + slash
+                            for retry in range(args.retry):
+                                s = get_status_text(
+                                    curr, total, method, target, retry + 1, args.retry
+                                )
+                                print_progress(s)
+                                if not args.new:
+                                    succ, conn = session_request(
+                                        sess,
+                                        target,
+                                        method,
+                                        payloads,
+                                        cookies,
+                                        headers,
+                                        args.timeout,
+                                        args.follow,
+                                        not args.insecure,
+                                    )
+                                else:
+                                    succ, conn = request(
+                                        target,
+                                        method,
+                                        auth,
+                                        payloads,
+                                        cookies,
+                                        headers,
+                                        proxies,
+                                        args.timeout,
+                                        args.follow,
+                                        not args.insecure,
+                                    )
+                                clear_progress(s)
+                                if succ:
+                                    break
+                            if not succ:
+                                err_msg = "[ERR]   [{m}]{p} {target}: {msg}".format(
+                                    m=method, target=target, msg=conn["err"], p=" " * padding
+                                )
+                                print_err(err_msg)
+                                if args.output is not None:
+                                    append_output(fp, err_msg)
+                            else:
+                                code = conn.status_code
+                                if check_code(code, args.code):
+                                    succ_msg = "[FOUND] [{code}] [{m}]{p} {target}".format(
+                                        code=code, m=method, target=target, p=" " * padding
+                                    )
+                                    print_succ(succ_msg)
+                                    if args.output is not None:
+                                        append_output(fp, succ_msg)
+                                elif args.verbose:
+                                    miss_msg = "[MISS]  [{c}] [{m}]{p} {t}".format(
+                                        c=code, m=method, t=target, p=" " * padding
+                                    )
+                                    print_miss(miss_msg)
+                                    if args.output is not None:
+                                        append_output(fp, miss_msg)
+                            if args.delay > 0:
+                                print_wait_message(args.delay)
+                                time.sleep(args.delay)
+                            curr += 1
+        print()
+
+    now = datetime.now()
+    end_msg = "Finished: {time}".format(time=now.strftime("%Y-%m-%d %H:%M:%S"))
+    print(end_msg)
+    # Close file descriptor
+    if args.output is not None:
+        append_output(fp, end_msg)
+        fp.close()
+
+
+if __name__ == "__main__":
+    # Catch Ctrl+c and exit without error message
+    try:
+        main()
+    except KeyboardInterrupt:
+        print()
+        sys.exit(1)
